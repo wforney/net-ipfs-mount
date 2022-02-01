@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "IpfsMount": {
+      "commandName": "Project",
+      "commandLineArgs": "x:"
+    }
+  }
+}

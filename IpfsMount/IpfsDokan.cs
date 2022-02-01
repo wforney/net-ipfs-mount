@@ -1,383 +1,348 @@
-﻿using DokanNet;
+﻿namespace Ipfs.VirtualDisk;
+
+using DokanNet;
 using Ipfs.Api;
-using IpfsFile = Ipfs.IFileSystemNode;
-using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.IO;
+using System.Linq;
 using System.Security.AccessControl;
-using Newtonsoft.Json.Linq;
 using System.Security.Principal;
 
-namespace Ipfs.VirtualDisk
+/// <summary>
+/// Maps Dokan opeations into IPFS.
+/// </summary>
+internal partial class IpfsDokan : IDokanOperations
 {
-    /// <summary>
-    ///   Maps Dokan opeations into IPFS.
-    /// </summary>
-    partial class IpfsDokan : IDokanOperations
-    {
-        const string rootName = @"\";
-        static string[] rootFolders = { "ipfs", "ipns" };
-        static IpfsClient ipfs = new IpfsClient();
-        static FileSecurity readonlyFileSecurity = new FileSecurity();
-        static DirectorySecurity readonlyDirectorySecurity = new DirectorySecurity();
+    private const string rootName = @"\";
+    private static readonly IpfsClient ipfs = new();
 
-        static IpfsDokan()
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "<Pending>")]
+    private static readonly DirectorySecurity readonlyDirectorySecurity = new();
+
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "<Pending>")]
+    private static readonly FileSecurity readonlyFileSecurity = new();
+
+    private static readonly string[] rootFolders = { "ipfs", "ipns" };
+
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "<Pending>")]
+    static IpfsDokan()
+    {
+        var everyone = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+        var everyoneRead = new FileSystemAccessRule(
+            everyone,
+            FileSystemRights.ReadAndExecute | FileSystemRights.ListDirectory,
+            AccessControlType.Allow);
+        readonlyFileSecurity.AddAccessRule(everyoneRead);
+        readonlyFileSecurity.SetOwner(everyone);
+        readonlyFileSecurity.SetGroup(everyone);
+        readonlyDirectorySecurity.AddAccessRule(everyoneRead);
+        readonlyDirectorySecurity.SetOwner(everyone);
+        readonlyDirectorySecurity.SetGroup(everyone);
+    }
+
+    public void Cleanup(string fileName, IDokanFileInfo info)
+    {
+        // Nothing to do.
+    }
+
+    public void CloseFile(string fileName, IDokanFileInfo info)
+    {
+        // Nothing to do.
+    }
+
+    public NtStatus CreateFile(string fileName, DokanNet.FileAccess access, FileShare share, FileMode mode, FileOptions options, FileAttributes attributes, IDokanFileInfo info)
+    {
+        // Read only access.
+        if (mode != FileMode.Open || (access & DokanNet.FileAccess.WriteData) != 0)
         {
-            var everyone = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
-            var everyoneRead = new FileSystemAccessRule(everyone, 
-                FileSystemRights.ReadAndExecute | FileSystemRights.ListDirectory,
-                AccessControlType.Allow);
-            readonlyFileSecurity.AddAccessRule(everyoneRead);
-            readonlyFileSecurity.SetOwner(everyone);
-            readonlyFileSecurity.SetGroup(everyone);
-            readonlyDirectorySecurity.AddAccessRule(everyoneRead);
-            readonlyDirectorySecurity.SetOwner(everyone);
-            readonlyDirectorySecurity.SetGroup(everyone);
+            return DokanResult.AccessDenied;
         }
 
-        public NtStatus CreateFile(string fileName, DokanNet.FileAccess access, FileShare share, FileMode mode, FileOptions options, FileAttributes attributes, DokanFileInfo info)
+        // Root and root folders are always present.
+        if (fileName == rootName || rootFolders.Any(name => fileName == (rootName + name)))
         {
-            // Read only access.
-            if (mode != FileMode.Open || (access & DokanNet.FileAccess.WriteData) != 0)
-                return DokanResult.AccessDenied;
-
-            // Root and root folders are always present.
-            if (fileName == rootName || rootFolders.Any(name => fileName == (rootName + name)))
-            {
-                info.IsDirectory = true;
-                return DokanResult.Success;
-            }
-
-            // Predefined files
-            PredefinedFile predefinedFile = null;
-            if (PredefinedFile.All.TryGetValue(fileName, out predefinedFile))
-            {
-                info.Context = predefinedFile;
-                return DokanResult.Success;
-            }
-
-            // Get file info from IPFS
-            var ipfsFileName = fileName.Replace(@"\", "/");
-            try
-            {
-                var file = GetIpfsFile(ipfsFileName);
-                info.Context = file;
-                info.IsDirectory = file.IsDirectory;
-            }
-            catch
-            {
-                return DokanResult.FileNotFound;
-            }
-
+            info.IsDirectory = true;
             return DokanResult.Success;
         }
 
-        IpfsFile GetIpfsFile(string name)
+        // Predefined files
+        if (PredefinedFile.All.TryGetValue(fileName, out var predefinedFile))
         {
-            return ipfs.FileSystem.ListFileAsync(name).Result;
+            info.Context = predefinedFile;
+            return DokanResult.Success;
         }
-        public NtStatus GetFileInformation(string fileName, out FileInformation fileInfo, DokanFileInfo info)
+
+        // Get file info from IPFS
+        string IFileSystemNodeName = fileName.Replace(@"\", "/");
+        try
         {
-            fileInfo = new FileInformation {
-                FileName = fileName,
-                Attributes = FileAttributes.ReadOnly
-            };
-            var file = info.Context as IpfsFile;
-            if (file != null)
-            {
-                if (file.IsDirectory)
-                    fileInfo.Attributes |= FileAttributes.Directory;
-                fileInfo.Length = file.Size;
-
-                return DokanResult.Success;
-            }
-
-            var predefinedFile = info.Context as PredefinedFile;
-            if (predefinedFile != null)
-            {
-                fileInfo.Length = predefinedFile.Data.Length;
-                return DokanResult.Success;
-            }
-
-            // Root info
-            if (fileName == rootName)
-            {
-                fileInfo.Attributes |= FileAttributes.Directory;
-                fileInfo.LastAccessTime = DateTime.Now;
-
-                return DokanResult.Success;
-            }
-
-            // Root folder info
-            if (rootFolders.Any(name => fileName == (rootName + name)))
-            {
-                fileInfo.Attributes |= FileAttributes.Directory;
-                fileInfo.LastAccessTime = DateTime.Now;
-
-                return DokanResult.Success;
-            }
-
+            var file = GetIFileSystemNode(IFileSystemNodeName);
+            info.Context = file;
+            info.IsDirectory = file.IsDirectory;
+        }
+        catch
+        {
             return DokanResult.FileNotFound;
         }
 
-        public NtStatus GetFileSecurity(string fileName, out FileSystemSecurity security, AccessControlSections sections, DokanFileInfo info)
+        return DokanResult.Success;
+    }
+
+    public NtStatus DeleteDirectory(string fileName, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus DeleteFile(string fileName, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus FindFiles(string fileName, out IList<FileInformation> files, IDokanFileInfo info)
+    {
+        if (info.Context is IFileSystemNode file)
         {
-            security = info.IsDirectory
-                ? (FileSystemSecurity) readonlyDirectorySecurity
-                : readonlyFileSecurity;
+            files = file.Links
+                .Select(
+                    link =>
+                        new FileInformation()
+                        {
+                            FileName = link.Name,
+                            Length = link.Size,
+                            Attributes = FileAttributes.ReadOnly | (file.IsDirectory ? FileAttributes.Directory : FileAttributes.Normal)
+                        })
+                .ToList();
             return DokanResult.Success;
         }
 
-        #region Volumne Operations
-        public NtStatus GetDiskFreeSpace(out long freeBytesAvailable, out long totalNumberOfBytes, out long totalNumberOfFreeBytes, DokanFileInfo info)
+        // '/ipfs' contains the pinned files.
+        if (fileName == @"\ipfs")
         {
-            freeBytesAvailable = 0;
-            totalNumberOfBytes = 0;
-            totalNumberOfFreeBytes = 0;
-
-            return NtStatus.Success;
-        }
-
-        public NtStatus GetVolumeInformation(
-            out string volumeLabel, 
-            out FileSystemFeatures features, 
-            out string fileSystemName, 
-            out uint maximumComponentLength,
-            DokanFileInfo info)
-        {
-            volumeLabel = "Interplanetary";
-            features = FileSystemFeatures.ReadOnlyVolume
-                | FileSystemFeatures.CasePreservedNames | FileSystemFeatures.CaseSensitiveSearch 
-                | FileSystemFeatures.PersistentAcls | FileSystemFeatures.SupportsRemoteStorage 
-                | FileSystemFeatures.UnicodeOnDisk | FileSystemFeatures.SupportsObjectIDs;
-            fileSystemName = "IPFS";
-            info.IsDirectory = true;
-            maximumComponentLength = 255;
-
-            return NtStatus.Success;
-        }
-
-        public NtStatus Mounted(DokanFileInfo info)
-        {
-            Console.WriteLine("IPFS mounted");
-            return NtStatus.Success;
-        }
-
-        public NtStatus Unmounted(DokanFileInfo info)
-        {
-            Console.WriteLine("IPFS unmounted");
-            return NtStatus.Success;
-        }
-
-        #endregion
-
-        #region File Operations
-        public NtStatus ReadFile(string fileName, byte[] buffer, out int bytesRead, long offset, DokanFileInfo info)
-        {
-            var predefinedFile = info.Context as PredefinedFile;
-            if (predefinedFile != null)
-            {
-                bytesRead = (int) Math.Min(buffer.LongLength, predefinedFile.Data.LongLength - offset);
-                Buffer.BlockCopy(predefinedFile.Data, (int)offset, buffer, 0, bytesRead);
-                return DokanResult.Success;
-            }
-
-
-            var file = (IpfsFile)info.Context;
-
-            using (var data = ipfs.FileSystem.ReadFileAsync(file.Id, offset, buffer.LongLength).Result)
-            {
-                // Fill the entire buffer
-                bytesRead = 0;
-                int bufferOffset = 0;
-                int remainingBytes = buffer.Length;
-                while (remainingBytes > 0)
-                {
-                    int n = data.Read(buffer, bufferOffset, remainingBytes);
-                    if (n < 1)
-                        break;
-                    bufferOffset += n;
-                    remainingBytes -= n;
-                    bytesRead += n;
-                }
-                return DokanResult.Success;
-            }
-       }
-
-        public NtStatus LockFile(string fileName, long offset, long length, DokanFileInfo info)
-        {
-            return DokanResult.Success; // LockFile does nothing
-        }
-
-        public NtStatus UnlockFile(string fileName, long offset, long length, DokanFileInfo info)
-        {
-            return DokanResult.Success; // UnlockFile does nothing
-        }
-
-        public NtStatus WriteFile(string fileName, byte[] buffer, out int bytesWritten, long offset, DokanFileInfo info)
-        {
-            bytesWritten = 0;
-            return DokanResult.AccessDenied;
-        }
-
-        public NtStatus DeleteFile(string fileName, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-
-        public NtStatus MoveFile(string oldName, string newName, bool replace, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-
-        public NtStatus SetAllocationSize(string fileName, long length, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-
-        public NtStatus SetEndOfFile(string fileName, long length, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-
-        public NtStatus SetFileAttributes(string fileName, FileAttributes attributes, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-
-        public NtStatus SetFileSecurity(string fileName, FileSystemSecurity security, AccessControlSections sections, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-
-        public NtStatus SetFileTime(string fileName, DateTime? creationTime, DateTime? lastAccessTime, DateTime? lastWriteTime, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-        #endregion
-
-        #region Directory Operations
-        public NtStatus FindFiles(string fileName, out IList<FileInformation> files, DokanFileInfo info)
-        {
-            var file = info.Context as IpfsFile;
-            if (file != null)
-            {
-                files = file.Links
-                    .Select(link => new FileInformation()
-                    {
-                        FileName = link.Name,
-                        Length = link.Size,
-                        Attributes = FileAttributes.ReadOnly
-                            | (link.IsDirectory ? FileAttributes.Directory : FileAttributes.Normal)
-                    })
-                    .ToList();
-                return DokanResult.Success;
-            }
-
-            // '/ipfs' contains the pinned files.
-            if (fileName == @"\ipfs")
-            {
-                var cids = ipfs.Pin.ListAsync().Result;
-                files = cids
-                    .Select(cid =>
+            var cids = ipfs.Pin.ListAsync().GetAwaiter().GetResult();
+            files = cids
+                .Select(
+                    cid =>
                     {
                         try
                         {
-                            return GetIpfsFile(cid);
+                            return GetIFileSystemNode(cid);
                         }
                         catch
                         {
                             return null;
                         }
                     })
-                    .Where(f => f != null)
-                    .Select(pinnedFile => new FileInformation
-                    {
-                        FileName = pinnedFile.Id,
-                        Length = pinnedFile.Size,
-                        Attributes = FileAttributes.ReadOnly
-                            | (pinnedFile.IsDirectory ? FileAttributes.Directory : FileAttributes.Normal)
-                    })
-                    .ToList();
-                return DokanResult.Success;
-            }
+                .Where(f => f is not null)
+                .Select(
+                    pinnedFile =>
+                        new FileInformation
+                        {
+                            FileName = pinnedFile.Id,
+                            Length = pinnedFile.Size,
+                            Attributes = FileAttributes.ReadOnly | (pinnedFile.IsDirectory ? FileAttributes.Directory : FileAttributes.Normal)
+                        })
+                .ToList();
+            return DokanResult.Success;
+        }
 
-            // The root consists of the root folders and the predefined files.
-            if (fileName == rootName)
+        // The root consists of the root folders and the predefined files.
+        if (fileName == rootName)
+        {
+            files = rootFolders
+                .Select(
+                    name =>
+                        new FileInformation
+                        {
+                            FileName = name,
+                            Attributes = FileAttributes.Directory | FileAttributes.ReadOnly,
+                            LastAccessTime = DateTime.Now
+                        })
+                .ToList();
+
+            foreach (var predefinedFile in PredefinedFile.All.Values)
             {
-                files = rootFolders
-                    .Select(name => new FileInformation
-                    {
-                        FileName = name,
-                        Attributes = FileAttributes.Directory | FileAttributes.ReadOnly,
-                        LastAccessTime = DateTime.Now
-                    })
-                    .ToList();
-                foreach (var predefinedFile in PredefinedFile.All.Values)
-                {
-                    files.Add(new FileInformation
+                files.Add(
+                    new FileInformation
                     {
                         FileName = Path.GetFileName(predefinedFile.Name),
                         Attributes = FileAttributes.ReadOnly,
                         Length = predefinedFile.Data.Length
                     });
-                }
-                return DokanResult.Success;
             }
 
-            // Can not determine the contents of the root folders.
-            if (rootFolders.Any(name => fileName == (rootName + name)))
-            {
-                files = new FileInformation[0];
-                return DokanResult.Success;
-            }
-
-            files = new FileInformation[0];
             return DokanResult.Success;
         }
 
-        public NtStatus FindFilesWithPattern(string fileName, string searchPattern, out IList<FileInformation> files, DokanFileInfo info)
+        // Can not determine the contents of the root folders.
+        if (rootFolders.Any(name => fileName == (rootName + name)))
         {
-            files = new FileInformation[0];
-            return DokanResult.NotImplemented;
-        }
-
-        public NtStatus DeleteDirectory(string fileName, DokanFileInfo info)
-        {
-            return DokanResult.AccessDenied;
-        }
-
-#endregion
-
-#region Misc Operations
-        public void Cleanup(string fileName, DokanFileInfo info)
-        {
-            // Nothing to do.
-        }
-
-        public void CloseFile(string fileName, DokanFileInfo info)
-        {
-            // Nothing to do.
-        }
-
-        public NtStatus FindStreams(string fileName, out IList<FileInformation> streams, DokanFileInfo info)
-        {
-            streams = null;
-            return DokanResult.NotImplemented;
-        }
-
-        public NtStatus FlushFileBuffers(string fileName, DokanFileInfo info)
-        {
+            files = Array.Empty<FileInformation>();
             return DokanResult.Success;
         }
 
-        #endregion
-
+        files = Array.Empty<FileInformation>();
+        return DokanResult.Success;
     }
+
+    public NtStatus FindFilesWithPattern(string fileName, string searchPattern, out IList<FileInformation> files, IDokanFileInfo info)
+    {
+        files = Array.Empty<FileInformation>();
+        return DokanResult.NotImplemented;
+    }
+
+    public NtStatus FindStreams(string fileName, out IList<FileInformation> streams, IDokanFileInfo info)
+    {
+        streams = null;
+        return DokanResult.NotImplemented;
+    }
+
+    public NtStatus FlushFileBuffers(string fileName, IDokanFileInfo info) => DokanResult.Success;
+
+    public NtStatus GetDiskFreeSpace(out long freeBytesAvailable, out long totalNumberOfBytes, out long totalNumberOfFreeBytes, IDokanFileInfo info)
+    {
+        freeBytesAvailable = 0;
+        totalNumberOfBytes = 0;
+        totalNumberOfFreeBytes = 0;
+
+        return NtStatus.Success;
+    }
+
+    public NtStatus GetFileInformation(string fileName, out FileInformation fileInfo, IDokanFileInfo info)
+    {
+        fileInfo = new FileInformation
+        {
+            FileName = fileName,
+            Attributes = FileAttributes.ReadOnly
+        };
+        if (info.Context is IFileSystemNode file)
+        {
+            if (file.IsDirectory)
+            {
+                fileInfo.Attributes |= FileAttributes.Directory;
+            }
+
+            fileInfo.Length = file.Size;
+
+            return DokanResult.Success;
+        }
+
+        if (info.Context is PredefinedFile predefinedFile)
+        {
+            fileInfo.Length = predefinedFile.Data.Length;
+            return DokanResult.Success;
+        }
+
+        // Root info
+        if (fileName == rootName)
+        {
+            fileInfo.Attributes |= FileAttributes.Directory;
+            fileInfo.LastAccessTime = DateTime.Now;
+
+            return DokanResult.Success;
+        }
+
+        // Root folder info
+        if (rootFolders.Any(name => fileName == (rootName + name)))
+        {
+            fileInfo.Attributes |= FileAttributes.Directory;
+            fileInfo.LastAccessTime = DateTime.Now;
+
+            return DokanResult.Success;
+        }
+
+        return DokanResult.FileNotFound;
+    }
+
+    public NtStatus GetFileSecurity(string fileName, out FileSystemSecurity security, AccessControlSections sections, IDokanFileInfo info)
+    {
+        security = info.IsDirectory ? readonlyDirectorySecurity : readonlyFileSecurity;
+        return DokanResult.Success;
+    }
+
+    public NtStatus GetVolumeInformation(out string volumeLabel, out FileSystemFeatures features, out string fileSystemName, out uint maximumComponentLength, IDokanFileInfo info)
+    {
+        volumeLabel = "Interplanetary";
+        features = FileSystemFeatures.ReadOnlyVolume
+            | FileSystemFeatures.CasePreservedNames
+            | FileSystemFeatures.CaseSensitiveSearch
+            | FileSystemFeatures.PersistentAcls
+            | FileSystemFeatures.SupportsRemoteStorage
+            | FileSystemFeatures.UnicodeOnDisk
+            | FileSystemFeatures.SupportsObjectIDs;
+        fileSystemName = "IPFS";
+        info.IsDirectory = true;
+        maximumComponentLength = 255;
+
+        return NtStatus.Success;
+    }
+
+    public NtStatus LockFile(string fileName, long offset, long length, IDokanFileInfo info) => DokanResult.Success;
+
+    public NtStatus Mounted(string mountPoint, IDokanFileInfo info)
+    {
+        Console.WriteLine("IPFS mounted");
+        return NtStatus.Success;
+    }
+
+    public NtStatus Mounted(IDokanFileInfo info)
+    {
+        Console.WriteLine("IPFS mounted");
+        return NtStatus.Success;
+    }
+
+    public NtStatus MoveFile(string oldName, string newName, bool replace, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus ReadFile(string fileName, byte[] buffer, out int bytesRead, long offset, IDokanFileInfo info)
+    {
+        if (info.Context is PredefinedFile predefinedFile)
+        {
+            bytesRead = (int)Math.Min(buffer.LongLength, predefinedFile.Data.LongLength - offset);
+            Buffer.BlockCopy(predefinedFile.Data, (int)offset, buffer, 0, bytesRead);
+            return DokanResult.Success;
+        }
+
+        var file = (IFileSystemNode)info.Context;
+
+        using var data = ipfs.FileSystem.ReadFileAsync(file.Id, offset, buffer.LongLength).GetAwaiter().GetResult();
+
+        // Fill the entire buffer
+        bytesRead = 0;
+        int bufferOffset = 0;
+        int remainingBytes = buffer.Length;
+        while (remainingBytes > 0)
+        {
+            int n = data.Read(buffer, bufferOffset, remainingBytes);
+            if (n < 1)
+            {
+                break;
+            }
+
+            bufferOffset += n;
+            remainingBytes -= n;
+            bytesRead += n;
+        }
+
+        return DokanResult.Success;
+    }
+
+    public NtStatus SetAllocationSize(string fileName, long length, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus SetEndOfFile(string fileName, long length, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus SetFileAttributes(string fileName, FileAttributes attributes, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus SetFileSecurity(string fileName, FileSystemSecurity security, AccessControlSections sections, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus SetFileTime(string fileName, DateTime? creationTime, DateTime? lastAccessTime, DateTime? lastWriteTime, IDokanFileInfo info) => DokanResult.AccessDenied;
+
+    public NtStatus UnlockFile(string fileName, long offset, long length, IDokanFileInfo info) => DokanResult.Success;
+
+    public NtStatus Unmounted(IDokanFileInfo info)
+    {
+        Console.WriteLine("IPFS unmounted");
+        return NtStatus.Success;
+    }
+
+    public NtStatus WriteFile(string fileName, byte[] buffer, out int bytesWritten, long offset, IDokanFileInfo info)
+    {
+        bytesWritten = 0;
+        return DokanResult.AccessDenied;
+    }
+
+    private static IFileSystemNode GetIFileSystemNode(string name) => ipfs.FileSystem.ListFileAsync(name).GetAwaiter().GetResult();
 }
-
-
